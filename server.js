@@ -1,0 +1,804 @@
+import { createReadStream, mkdirSync } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import { dirname, extname, join, normalize } from 'node:path';
+import { createServer } from 'node:http';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import Database from 'better-sqlite3';
+
+const port = Number(process.env.PORT ?? 3000);
+const appRoot = join(process.cwd(), 'app');
+const dbPath = join(process.cwd(), 'data', 'app.db');
+const jwtSecret = process.env.JWT_SECRET ?? 'local-development-secret';
+const postmanSigningKey = process.env.POSTMAN_SIGNING_KEY ?? 'local-postman-key';
+const sessionMaxAgeSeconds = 60 * 60 * 4;
+
+mkdirSync(dirname(dbPath), { recursive: true });
+const db = new Database(dbPath);
+db.pragma('journal_mode = WAL');
+
+const seedUsers = [
+  {
+    id: 'ada',
+    email: 'ada@example.com',
+    password: 'lovelace-123',
+    name: 'Ada Lovelace',
+    role: 'Automation Engineer',
+    team: 'Quality Platform',
+    access: 'user',
+  },
+  {
+    id: 'grace',
+    email: 'grace@example.com',
+    password: 'hopper-123',
+    name: 'Grace Hopper',
+    role: 'Test Architect',
+    team: 'Developer Experience',
+    access: 'user',
+  },
+  {
+    id: 'nick',
+    email: 'nick@example.com',
+    password: 'nick-123',
+    name: 'Nick Boegel',
+    role: 'Super User',
+    team: 'Analytics',
+    access: 'user',
+  },
+  {
+    id: 'admin',
+    email: 'admin@example.com',
+    password: 'admin-123',
+    name: 'Admin User',
+    role: 'Portal Administrator',
+    team: 'Platform Operations',
+    access: 'admin',
+  },
+];
+
+function nextUserId(name, email) {
+  const base = String(name || email)
+    .toLowerCase()
+    .replace(/@.*$/, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+  let id = base || `user-${Date.now()}`;
+  let suffix = 2;
+
+  while (findUserById(id)) {
+    id = `${base}-${suffix}`;
+    suffix += 1;
+  }
+
+  return id;
+}
+
+function getUsers() {
+  return db.prepare('SELECT id, email, password, name, role, team, access FROM users ORDER BY rowid').all();
+}
+
+function findUserById(id) {
+  return db.prepare('SELECT id, email, password, name, role, team, access FROM users WHERE id = ?').get(id);
+}
+
+function findUserByEmail(email) {
+  return db.prepare('SELECT id, email, password, name, role, team, access FROM users WHERE email = ?').get(email);
+}
+
+function getTaskById(id) {
+  const row = db
+    .prepare(
+      `SELECT id, title, assignee_id AS assigneeId, priority, status, due_date AS dueDate
+       FROM tasks
+       WHERE id = ?`,
+    )
+    .get(id);
+
+  return row;
+}
+
+function getTasksForUser(userId, filters = {}) {
+  const page = Math.max(Number(filters.page) || 1, 1);
+  const pageSize = Math.min(Math.max(Number(filters.pageSize) || 10, 1), 50);
+  const clauses = ['assignee_id = @userId'];
+  const params = {
+    userId,
+    limit: pageSize,
+    offset: (page - 1) * pageSize,
+  };
+
+  if (filters.q) {
+    clauses.push('(LOWER(title) LIKE @search OR LOWER(status) LIKE @search OR LOWER(priority) LIKE @search)');
+    params.search = `%${String(filters.q).toLowerCase()}%`;
+  }
+
+  if (filters.status && filters.status !== 'All') {
+    clauses.push('status = @status');
+    params.status = filters.status;
+  }
+
+  if (filters.priority && filters.priority !== 'All') {
+    clauses.push('priority = @priority');
+    params.priority = filters.priority;
+  }
+
+  const where = clauses.join(' AND ');
+  const total = db.prepare(`SELECT COUNT(*) AS count FROM tasks WHERE ${where}`).get(params).count;
+  const tasks = db
+    .prepare(
+      `SELECT id, title, assignee_id AS assigneeId, priority, status, due_date AS dueDate
+       FROM tasks
+       WHERE ${where}
+       ORDER BY rowid DESC
+       LIMIT @limit OFFSET @offset`,
+    )
+    .all(params);
+
+  return {
+    page,
+    pageSize,
+    total,
+    totalPages: Math.max(Math.ceil(total / pageSize), 1),
+    tasks,
+  };
+}
+
+const seedTasks = [
+  {
+    id: 'task-101',
+    title: 'Review pull request',
+    assigneeId: 'ada',
+    priority: 'High',
+    status: 'In progress',
+    dueDate: '2026-05-11',
+  },
+  {
+    id: 'task-102',
+    title: 'Update test plan',
+    assigneeId: 'grace',
+    priority: 'Medium',
+    status: 'Blocked',
+    dueDate: '2026-05-14',
+  },
+  {
+    id: 'task-103',
+    title: 'Triage flaky checkout test',
+    assigneeId: 'nick',
+    priority: 'High',
+    status: 'Open',
+    dueDate: '2026-05-18',
+  },
+];
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    password TEXT NOT NULL,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    team TEXT NOT NULL,
+    access TEXT NOT NULL CHECK (access IN ('user', 'admin'))
+  );
+
+  CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    assignee_id TEXT NOT NULL,
+    priority TEXT NOT NULL CHECK (priority IN ('High', 'Medium', 'Low')),
+    status TEXT NOT NULL CHECK (status IN ('Open', 'In progress', 'Blocked', 'Done')),
+    due_date TEXT,
+    FOREIGN KEY (assignee_id) REFERENCES users(id)
+  );
+`);
+
+const insertSeedUser = db.prepare(`
+  INSERT OR IGNORE INTO users (id, email, password, name, role, team, access)
+  VALUES (@id, @email, @password, @name, @role, @team, @access)
+`);
+seedUsers.forEach(user => insertSeedUser.run(user));
+
+const insertSeedTask = db.prepare(`
+  INSERT OR IGNORE INTO tasks (id, title, assignee_id, priority, status, due_date)
+  VALUES (@id, @title, @assigneeId, @priority, @status, @dueDate)
+`);
+seedTasks.forEach(task => insertSeedTask.run(task));
+
+const contentTypes = {
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+};
+
+function sendJson(response, statusCode, body) {
+  response.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
+  response.end(JSON.stringify(body));
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(JSON.stringify(value)).toString('base64url');
+}
+
+function signJwtPart(value) {
+  return createHmac('sha256', jwtSecret).update(value).digest('base64url');
+}
+
+function createJwt(user) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64UrlEncode({ alg: 'HS256', typ: 'JWT' });
+  const payload = base64UrlEncode({
+    sub: user.id,
+    email: user.email,
+    access: user.access,
+    iat: now,
+    exp: now + sessionMaxAgeSeconds,
+  });
+  const unsignedToken = `${header}.${payload}`;
+
+  return `${unsignedToken}.${signJwtPart(unsignedToken)}`;
+}
+
+function createDevJwt(user, expiresInHours = 24) {
+  const now = Math.floor(Date.now() / 1000);
+  const maxHours = 24 * 7;
+  const neverExpires = expiresInHours === 'never' || expiresInHours === 0 || expiresInHours === null;
+  const requestedHours = Number(expiresInHours);
+  const safeHours = Number.isFinite(requestedHours) ? Math.min(Math.max(requestedHours, 1), maxHours) : 24;
+  const claims = {
+    sub: user.id,
+    email: user.email,
+    access: user.access,
+    iat: now,
+  };
+
+  if (!neverExpires) {
+    claims.exp = now + safeHours * 60 * 60;
+  }
+
+  const header = base64UrlEncode({ alg: 'HS256', typ: 'JWT' });
+  const payload = base64UrlEncode(claims);
+  const unsignedToken = `${header}.${payload}`;
+
+  return {
+    token: `${unsignedToken}.${signJwtPart(unsignedToken)}`,
+    expiresIn: neverExpires ? null : safeHours * 60 * 60,
+  };
+}
+
+function verifyJwt(token) {
+  const [header, payload, signature] = String(token ?? '').split('.');
+
+  if (!header || !payload || !signature) return null;
+
+  const expectedSignature = signJwtPart(`${header}.${payload}`);
+  const expected = Buffer.from(expectedSignature);
+  const actual = Buffer.from(signature);
+
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    return null;
+  }
+
+  try {
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+
+    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+
+    return claims;
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(request) {
+  return Object.fromEntries(
+    String(request.headers.cookie ?? '')
+      .split(';')
+      .map(cookie => cookie.trim())
+      .filter(Boolean)
+      .map(cookie => {
+        const [name, ...value] = cookie.split('=');
+        return [name, decodeURIComponent(value.join('='))];
+      }),
+  );
+}
+
+function setSessionCookie(response, token) {
+  response.setHeader(
+    'Set-Cookie',
+    `session_token=${encodeURIComponent(token)}; Path=/; Max-Age=${sessionMaxAgeSeconds}; SameSite=Lax; HttpOnly`,
+  );
+}
+
+function clearSessionCookie(response) {
+  response.setHeader('Set-Cookie', 'session_token=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly');
+}
+
+function readJson(request) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+
+    request.on('data', chunk => {
+      body += chunk;
+
+      if (body.length > 10_000) {
+        request.destroy();
+        reject(new Error('Request body is too large'));
+      }
+    });
+    request.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        reject(new Error('Request body must be valid JSON'));
+      }
+    });
+    request.on('error', reject);
+  });
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+    team: user.team,
+    access: user.access,
+  };
+}
+
+function publicTask(task) {
+  const assignee = findUserById(task.assigneeId);
+
+  return {
+    id: task.id,
+    title: task.title,
+    assigneeId: task.assigneeId,
+    assignee: assignee?.name ?? 'Unknown user',
+    priority: task.priority,
+    status: task.status,
+    dueDate: task.dueDate,
+  };
+}
+
+function tokenFromRequest(request) {
+  const authorization = request.headers.authorization ?? '';
+  const bearerToken = authorization.replace(/^Bearer\s+/i, '');
+
+  return bearerToken || parseCookies(request).session_token;
+}
+
+function userFromRequest(request) {
+  const claims = verifyJwt(tokenFromRequest(request));
+
+  return findUserById(claims?.sub);
+}
+
+function requireUser(request, response) {
+  const user = userFromRequest(request);
+
+  if (!user) {
+    sendJson(response, 401, { message: 'A valid session token is required.' });
+    return null;
+  }
+
+  return user;
+}
+
+function requireAdmin(request, response) {
+  const user = requireUser(request, response);
+
+  if (!user) return null;
+
+  if (user.access !== 'admin') {
+    sendJson(response, 403, { message: 'Admin access is required.' });
+    return null;
+  }
+
+  return user;
+}
+
+function resolveFilePath(pathname) {
+  const routes = {
+    '/': 'index.html',
+    '/todos': 'todos.html',
+    '/sign-in': 'sign-in.html',
+    '/profile': 'profile.html',
+    '/unauthorized': 'unauthorized.html',
+  };
+
+  const routeFile = routes[pathname] ?? pathname.replace(/^\//, '');
+  const normalizedPath = normalize(routeFile);
+
+  if (normalizedPath.startsWith('..')) {
+    return null;
+  }
+
+  return join(appRoot, normalizedPath);
+}
+
+const server = createServer(async (request, response) => {
+  const url = new URL(request.url ?? '/', `http://${request.headers.host}`);
+
+  if (url.pathname === '/api/users' && request.method === 'GET') {
+    const sampleUserIds = new Set(['ada', 'grace', 'nick']);
+    sendJson(
+      response,
+      200,
+      getUsers()
+        .filter(user => sampleUserIds.has(user.id))
+        .map(user => ({
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role,
+          team: user.team,
+          access: user.access,
+        })),
+    );
+    return;
+  }
+
+  if (url.pathname === '/api/users' && request.method === 'POST') {
+    const admin = requireAdmin(request, response);
+
+    if (!admin) return;
+
+    try {
+      const newUser = await readJson(request);
+      const email = String(newUser.email ?? '').trim().toLowerCase();
+      const password = String(newUser.password ?? '');
+      const name = String(newUser.name ?? '').trim();
+      const role = String(newUser.role ?? '').trim();
+      const team = String(newUser.team ?? '').trim();
+      const access = newUser.access === 'admin' ? 'admin' : 'user';
+
+      if (!email || !password || !name || !role || !team) {
+        sendJson(response, 400, { message: 'Email, password, name, role, and team are required.' });
+        return;
+      }
+
+      if (findUserByEmail(email)) {
+        sendJson(response, 409, { message: 'A user with this email already exists.' });
+        return;
+      }
+
+      const createdUser = {
+        id: nextUserId(name, email),
+        email,
+        password,
+        name,
+        role,
+        team,
+        access,
+      };
+
+      db.prepare(
+        `INSERT INTO users (id, email, password, name, role, team, access)
+         VALUES (@id, @email, @password, @name, @role, @team, @access)`,
+      ).run(createdUser);
+      sendJson(response, 201, { user: publicUser(createdUser) });
+    } catch (error) {
+      sendJson(response, 400, { message: error.message });
+    }
+    return;
+  }
+
+  if (url.pathname.startsWith('/api/users/') && request.method === 'DELETE') {
+    const admin = requireAdmin(request, response);
+
+    if (!admin) return;
+
+    const userId = decodeURIComponent(url.pathname.replace('/api/users/', ''));
+    const user = findUserById(userId);
+
+    if (!user) {
+      sendJson(response, 404, { message: 'User not found.' });
+      return;
+    }
+
+    if (user.id === admin.id) {
+      sendJson(response, 400, { message: 'You cannot delete your own admin account.' });
+      return;
+    }
+
+    db.prepare('DELETE FROM tasks WHERE assignee_id = ?').run(user.id);
+    db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
+    sendJson(response, 200, { deletedUser: publicUser(user) });
+    return;
+  }
+
+  if (url.pathname === '/api/login') {
+    if (request.method !== 'POST') {
+      sendJson(response, 405, { message: 'Method not allowed' });
+      return;
+    }
+
+    try {
+      const credentials = await readJson(request);
+      const email = String(credentials.email ?? '').trim().toLowerCase();
+      const password = String(credentials.password ?? '');
+      const user = findUserByEmail(email);
+
+      if (!user || user.password !== password) {
+        sendJson(response, 401, { message: 'Email or password is incorrect.' });
+        return;
+      }
+
+      const token = createJwt(user);
+      setSessionCookie(response, token);
+      sendJson(response, 200, {
+        token,
+        expiresIn: sessionMaxAgeSeconds,
+        user: publicUser(user),
+      });
+    } catch (error) {
+      sendJson(response, 400, { message: error.message });
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/dev-token') {
+    if (request.method !== 'POST') {
+      sendJson(response, 405, { message: 'Method not allowed' });
+      return;
+    }
+
+    if (request.headers['x-signing-key'] !== postmanSigningKey) {
+      sendJson(response, 401, { message: 'A valid signing key is required.' });
+      return;
+    }
+
+    try {
+      const body = await readJson(request);
+      const email = String(body.email ?? '').trim().toLowerCase();
+      const user = findUserByEmail(email);
+
+      if (!user) {
+        sendJson(response, 404, { message: 'User not found.' });
+        return;
+      }
+
+      const devToken = createDevJwt(user, body.expiresInHours);
+      sendJson(response, 200, {
+        ...devToken,
+        user: publicUser(user),
+      });
+    } catch (error) {
+      sendJson(response, 400, { message: error.message });
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/logout') {
+    if (request.method !== 'POST') {
+      sendJson(response, 405, { message: 'Method not allowed' });
+      return;
+    }
+
+    clearSessionCookie(response);
+    sendJson(response, 200, { message: 'Signed out.' });
+    return;
+  }
+
+  if (url.pathname === '/api/session') {
+    const user = userFromRequest(request);
+
+    if (!user) {
+      sendJson(response, 401, { message: 'No active session.' });
+      return;
+    }
+
+    sendJson(response, 200, {
+      token: tokenFromRequest(request),
+      expiresIn: sessionMaxAgeSeconds,
+      user: publicUser(user),
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/profile') {
+    const user = userFromRequest(request);
+
+    if (!user) {
+      sendJson(response, 401, { message: 'Please sign in to load your profile.' });
+      return;
+    }
+
+    sendJson(response, 200, publicUser(user));
+    return;
+  }
+
+  if (url.pathname === '/api/dashboard') {
+    const user = userFromRequest(request);
+
+    if (!user) {
+      sendJson(response, 401, { message: 'Please sign in to view your dashboard.' });
+      return;
+    }
+
+    const assignedTasks = getTasksForUser(user.id, { page: 1, pageSize: 500 }).tasks;
+
+    sendJson(response, 200, {
+      owner: publicUser(user),
+      metrics: {
+        openTasks: assignedTasks.filter(task => task.status !== 'Done').length,
+        blockedTasks: assignedTasks.filter(task => task.status === 'Blocked').length,
+        highPriorityTasks: assignedTasks.filter(task => task.priority === 'High').length,
+      },
+      recentActivity: [
+        `${user.name} signed in`,
+        'Grace Hopper updated the test plan',
+        'Ada Lovelace reviewed a pull request',
+      ],
+      tasks: assignedTasks.map(publicTask),
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/tasks' && request.method === 'GET') {
+    const user = requireUser(request, response);
+
+    if (!user) return;
+
+    const result = getTasksForUser(user.id, {
+      page: url.searchParams.get('page'),
+      pageSize: url.searchParams.get('pageSize'),
+      q: url.searchParams.get('q'),
+      status: url.searchParams.get('status'),
+      priority: url.searchParams.get('priority'),
+    });
+
+    sendJson(response, 200, {
+      page: result.page,
+      pageSize: result.pageSize,
+      total: result.total,
+      totalPages: result.totalPages,
+      tasks: result.tasks.map(publicTask),
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/tasks' && request.method === 'POST') {
+    const user = requireUser(request, response);
+
+    if (!user) return;
+
+    try {
+      const task = await readJson(request);
+      const title = String(task.title ?? '').trim();
+      const assigneeId = String(task.assigneeId ?? '').trim();
+      const priority = ['High', 'Medium', 'Low'].includes(task.priority) ? task.priority : 'Medium';
+      const dueDate = String(task.dueDate ?? '').trim();
+
+      if (!title || !assigneeId) {
+        sendJson(response, 400, { message: 'Title and assigneeId are required.' });
+        return;
+      }
+
+      if (!findUserById(assigneeId)) {
+        sendJson(response, 404, { message: 'Assignee not found.' });
+        return;
+      }
+
+      const createdTask = {
+        id: `task-${randomUUID()}`,
+        title,
+        assigneeId,
+        priority,
+        status: 'Open',
+        dueDate,
+      };
+      db.prepare(
+        `INSERT INTO tasks (id, title, assignee_id, priority, status, due_date)
+         VALUES (@id, @title, @assigneeId, @priority, @status, @dueDate)`,
+      ).run(createdTask);
+
+      sendJson(response, 201, { task: publicTask(createdTask) });
+    } catch (error) {
+      sendJson(response, 400, { message: error.message });
+    }
+    return;
+  }
+
+  if (url.pathname.match(/^\/api\/tasks\/[^/]+\/complete$/) && request.method === 'PATCH') {
+    const user = requireUser(request, response);
+
+    if (!user) return;
+
+    const taskId = decodeURIComponent(url.pathname.split('/')[3]);
+    const task = getTaskById(taskId);
+
+    if (!task) {
+      sendJson(response, 404, { message: 'Task not found.' });
+      return;
+    }
+
+    if (task.assigneeId !== user.id && user.access !== 'admin') {
+      sendJson(response, 403, { message: 'You can only complete tasks assigned to you.' });
+      return;
+    }
+
+    db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run('Done', task.id);
+    sendJson(response, 200, { task: publicTask({ ...task, status: 'Done' }) });
+    return;
+  }
+
+  if (url.pathname.match(/^\/api\/tasks\/[^/]+$/) && request.method === 'DELETE') {
+    const user = requireUser(request, response);
+
+    if (!user) return;
+
+    const taskId = decodeURIComponent(url.pathname.split('/')[3]);
+    const task = getTaskById(taskId);
+
+    if (!task) {
+      sendJson(response, 404, { message: 'Task not found.' });
+      return;
+    }
+
+    if (task.assigneeId !== user.id && user.access !== 'admin') {
+      sendJson(response, 403, { message: 'You can only delete tasks assigned to you.' });
+      return;
+    }
+
+    db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id);
+    sendJson(response, 200, { deletedTask: publicTask(task) });
+    return;
+  }
+
+  if (url.pathname === '/api/user-info') {
+    const user = userFromRequest(request);
+
+    if (!user) {
+      sendJson(response, 401, { message: 'A valid session token is required.' });
+      return;
+    }
+
+    sendJson(response, 200, {
+      users: user.access === 'admin' ? getUsers().map(publicUser) : [publicUser(user)],
+    });
+    return;
+  }
+
+  const filePath = resolveFilePath(url.pathname);
+
+  if (!filePath) {
+    response.writeHead(403);
+    response.end('Forbidden');
+    return;
+  }
+
+  try {
+    const file = await stat(filePath);
+
+    if (!file.isFile()) {
+      response.writeHead(404);
+      response.end('Not found');
+      return;
+    }
+
+    response.writeHead(200, {
+      'content-type': contentTypes[extname(filePath)] ?? 'application/octet-stream',
+    });
+    createReadStream(filePath).pipe(response);
+  } catch {
+    response.writeHead(404);
+    response.end('Not found');
+  }
+});
+
+server.listen(port, '127.0.0.1', () => {
+  console.log(`Sample app running at http://127.0.0.1:${port}`);
+});
+
+function shutdown() {
+  server.close(() => {
+    db.close();
+    process.exit(0);
+  });
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

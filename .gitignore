@@ -1,0 +1,11 @@
+node_modules/
+playwright-report/
+test-results/
+ctrf/
+data/*.db
+data/*.db-*
+.env
+debug.log
+.tools/
+
+.early.coverage

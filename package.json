@@ -1,0 +1,33 @@
+{
+  "name": "playwright-automation-framework",
+  "version": "1.0.0",
+  "description": "A full-stack Playwright automation framework portfolio with UI, API, CI, and reporting coverage.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "playwright test",
+    "test:a11y": "playwright test tests/accessibility.spec.ts",
+    "test:visual": "playwright test tests/visual-regression.spec.ts --project=chromium",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "test:debug": "playwright test --debug",
+    "report": "playwright show-report"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.11.3",
+    "@playwright/test": "^1.62.0",
+    "@types/node": "^25.9.2",
+    "playwright-ctrf-json-reporter": "^0.0.29",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.1"
+  }
+}

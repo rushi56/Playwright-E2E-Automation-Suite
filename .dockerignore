@@ -1,0 +1,10 @@
+node_modules/
+playwright-report/
+test-results/
+ctrf/
+data/*.db
+data/*.db-*
+.git/
+.tools/
+.env
+debug.log
